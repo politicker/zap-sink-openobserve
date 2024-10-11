@@ -1,4 +1,4 @@
-module github.com/politicker/zap-sink-obenobserve
+module github.com/politicker/zap-sink-openobserve
 
 go 1.19
 
