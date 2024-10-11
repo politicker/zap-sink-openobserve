@@ -1,122 +1,148 @@
 package sink
 
 import (
-	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
-	"os"
+	"strings"
 
-	"github.com/DataDog/datadog-api-client-go/v2/api/datadog"
-	"github.com/DataDog/datadog-api-client-go/v2/api/datadogV2"
 	"go.uber.org/zap"
 )
 
-type DataDogSink struct {
-	ctx      context.Context
-	dd       *datadogV2.LogsApi
-	service  string
-	hostname string
-	tags     string
-	source   string
+// Example of how to implement a http request to the OpenObserve API
+// data := `[{
+// 	"kubernetes.annotations.kubectl.kubernetes.io/default-container": "prometheus",
+// 	"kubernetes.annotations.kubernetes.io/psp": "eks.privileged",
+// 	"kubernetes.container_hash": "quay.io/prometheus/prometheus@sha256:4748e26f9369ee7270a7cd3fb9385c1adb441c05792ce2bce2f6dd622fd91d38",
+// 	"kubernetes.container_image": "quay.io/prometheus/prometheus:v2.39.1",
+// 	"kubernetes.container_name": "prometheus",
+// 	"kubernetes.docker_id": "563f8f40062cd0188c11f39e89d47e6eacddb5624a8a93b39f77ec53b5c38bf5",
+// 	"kubernetes.host": "ip-10-2-50-35.us-east-2.compute.internal",
+// 	"kubernetes.labels.app.kubernetes.io/component": "prometheus",
+// 	"kubernetes.labels.app.kubernetes.io/instance": "k8s",
+// 	"kubernetes.labels.app.kubernetes.io/managed-by": "prometheus-operator",
+// 	"kubernetes.labels.app.kubernetes.io/name": "prometheus",
+// 	"kubernetes.labels.app.kubernetes.io/part-of": "kube-prometheus",
+// 	"kubernetes.labels.app.kubernetes.io/version": "2.39.1",
+// 	"kubernetes.labels.controller-revision-hash": "prometheus-k8s-5857d9766c",
+// 	"kubernetes.labels.operator.prometheus.io/name": "k8s",
+// 	"kubernetes.labels.operator.prometheus.io/shard": "0",
+// 	"kubernetes.labels.prometheus": "k8s",
+// 	"kubernetes.labels.statefulset.kubernetes.io/pod-name": "prometheus-k8s-1",
+// 	"kubernetes.namespace_name": "monitoring",
+// 	"kubernetes.pod_id": "ebdc171d-c891-495f-b4d6-e24711b70e64",
+// 	"kubernetes.pod_name": "prometheus-k8s-1",
+// 	"log": "ts=2022-12-27T14:09:59.212Z caller=klog.go:108 level=warn component=k8s_client_runtime func=Warningf msg=\"pkg/mod/k8s.io/client-go@v0.25.1/tools/cache/reflector.go:169: failed to list *v1.Pod: pods is forbidden: User \\\"system:serviceaccount:monitoring:prometheus-k8s\\\" cannot list resource \\\"pods\\\" in API group \\\"\\\" at the cluster scope\"",
+// 	"stream": "stderr"
+// }]`
+// req, err := http.NewRequest("POST", "http://localhost:5080/api/default/quickstart1/_json", strings.NewReader(data))
+// if err != nil {
+// 	log.Fatal(err)
+// }
+// req.SetBasicAuth("root@example.com", "Complexpass#123")
+// req.Header.Set("Content-Type", "application/json")
+// req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/81.0.4044.138 Safari/537.36")
+
+// resp, err := http.DefaultClient.Do(req)
+// if err != nil {
+// 	log.Fatal(err)
+// }
+// defer resp.Body.Close()
+// log.Println(resp.StatusCode)
+// body, err := io.ReadAll(resp.Body)
+// if err != nil {
+// 	log.Fatal(err)
+// }
+// fmt.Println(string(body))
+
+type OpenObserveSink struct {
+	url      string
+	username string
+	password string
+	messages []map[string]interface{}
 }
 
-func (s DataDogSink) Write(p []byte) (int, error) {
-	fmt.Println(string(p))
-
-	body := []datadogV2.HTTPLogItem{
-		{
-			Ddsource: datadog.PtrString(s.source),
-			Ddtags:   datadog.PtrString(s.tags),
-			Hostname: datadog.PtrString(s.hostname),
-			Message:  string(p),
-			Service:  datadog.PtrString(s.service),
-		},
+func (s *OpenObserveSink) Write(p []byte) (int, error) {
+	msg := make(map[string]interface{})
+	if err := json.Unmarshal(p, &msg); err != nil {
+		return 0, fmt.Errorf("unmarshal failed: %w", err)
 	}
 
-	_, r, err := s.dd.SubmitLog(s.ctx, body, *datadogV2.NewSubmitLogOptionalParameters().WithContentEncoding(datadogV2.CONTENTENCODING_DEFLATE))
+	s.messages = append(s.messages, msg)
 
+	// TODO: could add buffering here
+	return len(p), s.Sync()
+}
+
+func (s *OpenObserveSink) Sync() error {
+	if len(s.messages) == 0 {
+		return nil
+	}
+
+	data, err := json.Marshal(s.messages)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error when calling `LogsApi.SubmitLog`: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Full HTTP response: %v\n", r)
+		return fmt.Errorf("marshal failed: %w", err)
 	}
 
-	return 0, nil
-}
+	req, err := http.NewRequest("POST", s.url, strings.NewReader(string(data)))
+	if err != nil {
+		return fmt.Errorf("new request failed: %w", err)
+	}
 
-func (s DataDogSink) Sync() error {
+	req.SetBasicAuth(s.username, s.password)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("do failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code: %d\nrequest url: %s\nrequest body: %s", resp.StatusCode, s.url, string(data))
+	}
+
+	s.messages = nil
 	return nil
 }
 
-func (s DataDogSink) Close() error {
-	return nil
+func (s *OpenObserveSink) Close() error {
+	return s.Sync()
 }
 
-func New(site string, service string, hostname string, tags string, source string) (*DataDogSink, error) {
-	apiKey := os.Getenv("DD_API_KEY")
-	if apiKey == "" {
-		return nil, errors.New("missing env DD_API_KEY")
-	}
-
-	// configure credentials for datadog api
-	ctx := context.WithValue(
-		context.Background(),
-		datadog.ContextAPIKeys,
-		map[string]datadog.APIKey{
-			"apiKeyAuth": {
-				Key: apiKey,
-			},
-		},
-	)
-
-	config := datadog.NewConfiguration()
-	_, err := config.Servers.URL(0, map[string]string{"site": site})
-	if err != nil {
-		return nil, fmt.Errorf("site is invalid: %v", err)
-	}
-
-	// configure datadog api endpoint (site)
-	ctx = context.WithValue(ctx,
-		datadog.ContextServerVariables,
-		map[string]string{
-			"site": site,
-		},
-	)
-
-	return &DataDogSink{
-		ctx:      ctx,
-		dd:       datadogV2.NewLogsApi(datadog.NewAPIClient(config)),
-		service:  service,
-		hostname: hostname,
-		tags:     tags,
-		source:   source,
+func New(url, username, password string) (*OpenObserveSink, error) {
+	return &OpenObserveSink{
+		url:      url,
+		username: username,
+		password: password,
 	}, nil
 }
 
 func init() {
-	err := zap.RegisterSink("dd", func(u *url.URL) (zap.Sink, error) {
-		site := u.Host
-		service := u.Path
-		hostname := u.Query().Get("hostname")
-		tags := u.Query().Get("tags")
-		source := u.Query().Get("source")
+	err := zap.RegisterSink("oo", func(u *url.URL) (zap.Sink, error) {
+		addr := u.Host
+		path := u.Path
 
-		if source == "" {
-			source = "zap-logger"
+		proto := u.Query().Get("proto")
+		if proto == "" {
+			log.Fatal("missing proto")
 		}
 
-		if service == "" {
-			return nil, errors.New("missing service name")
-		} else {
-			service = service[1:]
+		username := u.Query().Get("username")
+		if username == "" {
+			log.Fatal("missing username")
 		}
 
-		if service == "" {
-			return nil, errors.New("missing service name")
+		password := u.Query().Get("password")
+		if password == "" {
+			log.Fatal("missing password")
 		}
 
-		sink, err := New(site, service, hostname, tags, source)
+		url := fmt.Sprintf("%s://%s%s", proto, addr, path)
+
+		sink, err := New(url, username, password)
 		if err != nil {
 			return nil, fmt.Errorf("init failed: %v", err)
 		}
